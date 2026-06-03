@@ -1,0 +1,8 @@
+# Generated outputs
+*.log
+*.7z
+*.json
+*.sh
+
+# Rust build artifacts
+/target/
