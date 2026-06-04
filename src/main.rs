@@ -791,15 +791,17 @@ fn gen_script(cpp_tree: &DirTree, inc_tree: &DirTree) -> String {
     script.push_str("NEW_DIR=\"$1\"\n\n");
     script.push_str(&format!("# Source root: {}\n", root));
     script.push_str("mkdir -p \"$NEW_DIR\"\n\n");
-    script.push_str("# ---- Create directory structure (C/C++ sources) ----\n");
 
-    collect_dirs(&cpp_tree.tree, root, &mut script);
-
+    let mut mkdir_paths: HashSet<String> = HashSet::new();
+    collect_mkdir_rels(&cpp_tree.tree, root, &mut mkdir_paths);
     let mut cpp_paths: HashSet<String> = HashSet::new();
     collect_all_dir_paths(&cpp_tree.tree, &mut cpp_paths);
+    collect_extra_mkdir_rels(&inc_tree.tree, &cpp_paths, root, &mut mkdir_paths);
 
-    script.push_str("\n# ---- Create extra include directories ----\n");
-    collect_extra_dirs(&inc_tree.tree, &cpp_paths, root, &mut script);
+    script.push_str("# ---- Create directories ----\n");
+    for rel in prune_redundant_mkdir_paths(&mkdir_paths) {
+        script.push_str(&format!("mkdir -p \"$NEW_DIR/{}\"\n", rel));
+    }
 
     script.push_str("\n# ---- Copy source files ----\n");
 
@@ -840,18 +842,42 @@ fn collect_all_dir_paths(node: &DirNode, paths: &mut HashSet<String>) {
     }
 }
 
-fn collect_extra_dirs(
+/// 去掉被更深路径覆盖的浅层路径（`mkdir -p` 会一并创建父目录）。
+fn prune_redundant_mkdir_paths(paths: &HashSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = paths
+        .iter()
+        .filter(|p| {
+            !paths
+                .iter()
+                .any(|q| *q != **p && q.starts_with(&format!("{p}/")))
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+fn collect_mkdir_rels(node: &DirNode, root: &str, paths: &mut HashSet<String>) {
+    let rel = rel_under_root(&node.path, root);
+    if !rel.is_empty() {
+        paths.insert(rel);
+    }
+    for child in node.dirs.values() {
+        collect_mkdir_rels(child, root, paths);
+    }
+}
+
+fn collect_extra_mkdir_rels(
     node: &DirNode,
     cpp_paths: &HashSet<String>,
     root: &str,
-    script: &mut String,
+    paths: &mut HashSet<String>,
 ) {
     if node.path != root && !cpp_paths.contains(&node.path) {
-        let rel = rel_under_root(&node.path, root);
-        script.push_str(&format!("mkdir -p \"$NEW_DIR/{}\"\n", rel));
+        paths.insert(rel_under_root(&node.path, root));
     }
     for child in node.dirs.values() {
-        collect_extra_dirs(child, cpp_paths, root, script);
+        collect_extra_mkdir_rels(child, cpp_paths, root, paths);
     }
 }
 
@@ -872,16 +898,6 @@ fn collect_header_copies(node: &DirNode, root: &str, script: &mut String, count:
     }
     for child in node.dirs.values() {
         collect_header_copies(child, root, script, count);
-    }
-}
-
-fn collect_dirs(node: &DirNode, root: &str, script: &mut String) {
-    let rel = rel_under_root(&node.path, root);
-    if !rel.is_empty() {
-        script.push_str(&format!("mkdir -p \"$NEW_DIR/{}\"\n", rel));
-    }
-    for (_name, child) in &node.dirs {
-        collect_dirs(child, root, script);
     }
 }
 
@@ -1009,6 +1025,22 @@ encoder.o: encoder.cpp /var/project/app/common/foo.hpp
         assert_eq!(blocks[0].object, "main.o");
         assert!(blocks[0].deps.iter().any(|d| d.contains("config.h")));
         assert_eq!(blocks[1].object, "encoder.o");
+    }
+
+    #[test]
+    fn prune_mkdir_drops_shallow_paths() {
+        let paths: HashSet<String> = [
+            "app".into(),
+            "app/common".into(),
+            "app/common/hdmirx/it6802".into(),
+            "tools".into(),
+        ]
+        .into_iter()
+        .collect();
+        let pruned = prune_redundant_mkdir_paths(&paths);
+        assert_eq!(pruned.len(), 2);
+        assert!(pruned.contains(&"app/common/hdmirx/it6802".to_string()));
+        assert!(pruned.contains(&"tools".to_string()));
     }
 
     #[test]
