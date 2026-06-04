@@ -3,6 +3,7 @@
 *.7z
 *.json
 *.sh
+!flatcopy_tree.sh
 
 # Rust build artifacts
 /target/

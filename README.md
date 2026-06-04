@@ -73,6 +73,21 @@ chmod +x project_copy_sources.sh
 
 在**任意目录**执行均可；脚本内 `cp` 使用源文件绝对路径。
 
+## flatcopy_tree.sh（平铺复制）
+
+仓库自带的辅助脚本，与 `log2cc` 生成的 `<prefix>_copy_sources.sh` 无关：后者按原目录层级复制参与编译的源/头文件；本脚本把**源目录下所有文件**平铺到目的目录根下，不保留子目录。
+
+| 项 | 说明 |
+|----|------|
+| 用途 | 快速导出某棵树里的全部文件到单目录（如交给只看文件名的工具） |
+| 重名 | 同名文件自动重命名为 `name_1.ext`、`name_2.ext` … |
+| 约束 | 源目录须存在且含文件；目的目录**不得已存在**（脚本会新建） |
+
+```bash
+chmod +x flatcopy_tree.sh
+./flatcopy_tree.sh /path/to/source_tree /path/to/new_flat_dir
+```
+
 ## 工作原理
 
 1. **解析 stdout** — 追踪 `make[N]: Entering directory` 得工作目录；识别带 `-c` 的编译命令；解析源文件绝对路径
@@ -85,8 +100,9 @@ chmod +x project_copy_sources.sh
 ```
 .
 ├── Cargo.toml
+├── flatcopy_tree.sh   # 平铺复制辅助脚本（非 log2cc 生成）
 ├── src/
-│   └── main.rs    # 唯一入口，四步流水线
+│   └── main.rs        # 唯一入口，四步流水线
 └── LICENSE
 ```
 
