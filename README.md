@@ -14,22 +14,23 @@
 ```bash
 git clone https://github.com/GetGitGo/get-build-db.git
 cd get-build-db
-cargo run -- /path/to/build.log
+cargo run -- /path/to/project_build_all.log
 ```
 
-输出三个文件（本地生成，已在 `.gitignore` 中忽略）：
+输出四个文件（本地生成，已在 `.gitignore` 中忽略）。文件名前缀为输入日志名（去扩展名）按 `_` 或 `-` 分割的第一节，例如 `project_build_all.log` 或 `project-build-all.log` → 前缀 `project`：
 
 | 文件 | 说明 |
 |------|------|
-| `compile_commands.json` | 编译数据库（clangd / LSP 可用） |
-| `dir_tree.json` | 以公共根为起点的目录树 |
-| `copy_sources.sh` | 源码复制脚本（含 tar 打包） |
+| `<prefix>_compile_commands.json` | 编译数据库（clangd / LSP 可用） |
+| `<prefix>_cpp_dir_tree.json` | 以公共根为起点的 C/C++ 源文件目录树 |
+| `<prefix>_inc_dir_tree.json` | 以公共根为起点的 include 搜索路径（`-I`/`-isystem`）目录树 |
+| `<prefix>_copy_sources.sh` | 源码复制脚本（含 tar 打包） |
 
 ## 生成的脚本用法
 
 ```bash
-chmod +x copy_sources.sh
-./copy_sources.sh my_project
+chmod +x project_copy_sources.sh
+./project_copy_sources.sh my_project
 ```
 
 在**当前工作目录**下：
@@ -41,8 +42,9 @@ chmod +x copy_sources.sh
 ## 工作原理
 
 1. **解析日志** — 追踪 `make[N]: Entering directory` 获取工作目录；识别编译器行（gcc / g++ / clang / 交叉编译链）；用 `-c` 区分编译与链接；从 `-c -o obj.o src.c` 提取源文件并解析为绝对路径
-2. **构建目录树** — 对全部源文件路径求公共祖先根，按目录层级分组，文件按字母排序
-3. **生成脚本** — 遍历目录树输出 `mkdir -p` 与 `cp` 命令
+2. **构建 C/C++ 目录树** — 对全部源文件路径求公共祖先根，按目录层级分组，文件按字母排序
+3. **构建 include 目录树** — 从编译命令提取 `-I`/`-isystem` 路径，解析为绝对路径，去重后按目录层级组织
+4. **生成脚本** — 遍历 C/C++ 目录树输出 `mkdir -p` 与 `cp` 命令
 
 ## 项目结构
 
@@ -50,7 +52,7 @@ chmod +x copy_sources.sh
 .
 ├── Cargo.toml
 ├── src/
-│   └── main.rs    # 唯一入口，三步流水线
+│   └── main.rs    # 唯一入口，四步流水线
 └── LICENSE
 ```
 

@@ -64,7 +64,7 @@ fn parse_log(input: &str) -> Vec<CompileCommand> {
     }
 
     eprintln!(
-        "Step 1/3: Extracted {} compile commands (skipped: {} link, {} unrecognized)",
+        "Step 1/4: Extracted {} compile commands (skipped: {} link, {} unrecognized)",
         commands.len(),
         skipped_link,
         skipped_other
@@ -133,42 +133,123 @@ fn extract_source<'a>(line: &'a str, exts: &HashSet<&str>) -> Option<&'a str> {
 }
 
 fn resolve_path(source: &str, dir: &str) -> String {
-    let path = Path::new(source);
-    if path.is_absolute() {
-        return source.to_string();
+    if unix_path::is_absolute(source) {
+        unix_path::normalize(source)
+    } else {
+        unix_path::join(dir, source)
     }
-    normalize_path(&Path::new(dir).join(source))
 }
 
-fn normalize_path(path: &Path) -> String {
-    use std::path::Component;
-    let mut components = Vec::new();
-    for comp in path.components() {
-        match comp {
-            Component::ParentDir => {
-                components.pop();
+mod unix_path {
+    pub fn is_absolute(path: &str) -> bool {
+        path.starts_with('/')
+    }
+
+    pub fn normalize(path: &str) -> String {
+        let is_abs = path.starts_with('/');
+        let mut stack: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if stack.is_empty() {
+                        if !is_abs {
+                            stack.push("..");
+                        }
+                    } else if stack.last() == Some(&"..") {
+                        stack.push("..");
+                    } else {
+                        stack.pop();
+                    }
+                }
+                _ => stack.push(part),
             }
-            Component::CurDir => {}
-            c => components.push(c),
+        }
+        if stack.is_empty() {
+            return if is_abs { "/".to_string() } else { ".".to_string() };
+        }
+        let body = stack.join("/");
+        if is_abs {
+            format!("/{body}")
+        } else {
+            body
         }
     }
-    if components.is_empty() {
-        return String::from(".");
+
+    pub fn join(base: &str, rel: &str) -> String {
+        if rel.is_empty() {
+            return normalize(base);
+        }
+        if is_absolute(rel) {
+            return normalize(rel);
+        }
+        normalize(&format!("{}/{}", base.trim_end_matches('/'), rel))
     }
-    let mut result = String::new();
-    for (i, c) in components.iter().enumerate() {
-        if i > 0 {
-            let prev = &components[i - 1];
-            if !matches!(prev, Component::RootDir) {
-                result.push('/');
+
+    pub fn dirname(path: &str) -> String {
+        let path = path.trim_end_matches('/');
+        if let Some(pos) = path.rfind('/') {
+            if pos == 0 {
+                "/".to_string()
+            } else {
+                path[..pos].to_string()
+            }
+        } else {
+            ".".to_string()
+        }
+    }
+
+    pub fn basename(path: &str) -> String {
+        let path = path.trim_end_matches('/');
+        path.rsplit('/').next().unwrap_or(path).to_string()
+    }
+
+    fn split_parts(path: &str) -> Vec<&str> {
+        path.split('/').filter(|p| !p.is_empty()).collect()
+    }
+
+    pub fn relative_parts(target: &str, base: &str) -> Vec<String> {
+        let target_parts = split_parts(target);
+        let base_parts = split_parts(base);
+        let mut i = 0;
+        while i < target_parts.len() && i < base_parts.len() && target_parts[i] == base_parts[i] {
+            i += 1;
+        }
+        target_parts[i..].iter().map(|s| s.to_string()).collect()
+    }
+
+    pub fn common_prefix(paths: &[&str]) -> String {
+        if paths.is_empty() {
+            return ".".to_string();
+        }
+        let components: Vec<Vec<&str>> = paths.iter().map(|p| split_parts(p)).collect();
+        let mut common = Vec::new();
+        let min_len = components.iter().map(|c| c.len()).min().unwrap_or(0);
+        for i in 0..min_len {
+            let comp = components[0][i];
+            if components.iter().all(|c| c[i] == comp) {
+                common.push(comp);
+            } else {
+                break;
             }
         }
-        result.push_str(c.as_os_str().to_str().unwrap_or(""));
+        if common.is_empty() {
+            return if paths[0].starts_with('/') {
+                "/".to_string()
+            } else {
+                ".".to_string()
+            };
+        }
+        let body = common.join("/");
+        if paths[0].starts_with('/') {
+            format!("/{body}")
+        } else {
+            body
+        }
     }
-    result
 }
 
-// ── Step 2: compile_commands → dir_tree ─────────────────────────────────────
+// ── Step 2: compile_commands → cpp_dir_tree ─────────────────────────────────
 
 #[derive(Serialize)]
 struct DirTree {
@@ -186,16 +267,11 @@ struct DirNode {
     dirs: BTreeMap<String, DirNode>,
 }
 
-fn build_tree(commands: &[CompileCommand]) -> DirTree {
+fn build_cpp_tree(commands: &[CompileCommand]) -> DirTree {
     let mut dir_files: HashMap<String, Vec<String>> = HashMap::new();
     for cmd in commands {
-        let dir = Path::new(&cmd.file).parent().unwrap().to_str().unwrap().to_string();
-        let filename = Path::new(&cmd.file)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
+        let dir = unix_path::dirname(&cmd.file);
+        let filename = unix_path::basename(&cmd.file);
         dir_files.entry(dir).or_default().push(filename);
     }
     for files in dir_files.values_mut() {
@@ -203,14 +279,9 @@ fn build_tree(commands: &[CompileCommand]) -> DirTree {
     }
 
     let all_dirs: Vec<&str> = dir_files.keys().map(|d| d.as_str()).collect();
-    let common_root = find_common_root(&all_dirs);
+    let common_root = unix_path::common_prefix(&all_dirs);
 
-    let root_name = Path::new(&common_root)
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("."))
-        .to_str()
-        .unwrap()
-        .to_string();
+    let root_name = unix_path::basename(&common_root);
 
     let mut root_node = DirNode {
         name: root_name.clone(),
@@ -220,17 +291,16 @@ fn build_tree(commands: &[CompileCommand]) -> DirTree {
     };
 
     for (dir_path, files) in &dir_files {
-        let rel = pathdiff::diff_paths(dir_path, &common_root)
-            .unwrap_or_else(|| Path::new(dir_path).to_path_buf());
-        if rel.as_os_str().is_empty() {
+        let rel_parts = unix_path::relative_parts(dir_path, &common_root);
+        if rel_parts.is_empty() {
             root_node.files.extend(files.iter().cloned());
         } else {
-            insert_into_tree(&mut root_node, &rel, &common_root, files);
+            insert_into_tree(&mut root_node, &rel_parts, &common_root, files);
         }
     }
 
     eprintln!(
-        "Step 2/3: Directory tree built — {} dirs, {} files",
+        "Step 2/4: C/C++ directory tree built — {} dirs, {} files",
         dir_files.len(),
         commands.len()
     );
@@ -241,56 +311,16 @@ fn build_tree(commands: &[CompileCommand]) -> DirTree {
     }
 }
 
-fn find_common_root(paths: &[&str]) -> String {
-    if paths.is_empty() {
-        return ".".to_string();
-    }
-    let components: Vec<Vec<&str>> = paths
-        .iter()
-        .map(|p| {
-            Path::new(p)
-                .components()
-                .filter_map(|c| c.as_os_str().to_str())
-                .collect()
-        })
-        .collect();
-    let mut common = Vec::new();
-    let min_len = components.iter().map(|c| c.len()).min().unwrap_or(0);
-    for i in 0..min_len {
-        let comp = components[0][i];
-        if components.iter().all(|c| c[i] == comp) {
-            common.push(comp);
-        } else {
-            break;
-        }
-    }
-    if common.is_empty() {
-        return "/".to_string();
-    }
-    let mut result = String::new();
-    for c in &common {
-        if !result.is_empty() && !result.ends_with('/') {
-            result.push('/');
-        }
-        result.push_str(c);
-    }
-    if Path::new(paths[0]).is_absolute() && !result.starts_with('/') {
-        result.insert(0, '/');
-    }
-    result
-}
-
-fn insert_into_tree(node: &mut DirNode, rel: &Path, base: &str, files: &[String]) {
+fn insert_into_tree(node: &mut DirNode, rel_parts: &[String], base: &str, files: &[String]) {
     let mut current = node;
     let mut cum_path = base.to_string();
-    for comp in rel.components() {
-        let name = comp.as_os_str().to_str().unwrap();
-        cum_path = Path::new(&cum_path).join(name).to_str().unwrap().to_string();
+    for name in rel_parts {
+        cum_path = unix_path::join(&cum_path, name);
         current = current
             .dirs
-            .entry(name.to_string())
+            .entry(name.clone())
             .or_insert_with(|| DirNode {
-                name: name.to_string(),
+                name: name.clone(),
                 path: cum_path.clone(),
                 files: Vec::new(),
                 dirs: BTreeMap::new(),
@@ -301,45 +331,94 @@ fn insert_into_tree(node: &mut DirNode, rel: &Path, base: &str, files: &[String]
     current.files.dedup();
 }
 
-mod pathdiff {
-    use std::path::{Component, Path, PathBuf};
+// ── Step 3: compile_commands → inc_dir_tree ─────────────────────────────────
 
-    pub fn diff_paths(target: &str, base: &str) -> Option<PathBuf> {
-        let target = Path::new(target);
-        let base = Path::new(base);
-        let target_comps: Vec<_> = target.components().collect();
-        let base_comps: Vec<_> = base.components().collect();
-        let mut i = 0;
-        while i < target_comps.len()
-            && i < base_comps.len()
-            && target_comps[i] == base_comps[i]
-        {
+fn extract_include_dirs(command: &str, directory: &str) -> Vec<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if token == "-I" || token == "-isystem" {
             i += 1;
-        }
-        let mut result = PathBuf::new();
-        for _ in i..base_comps.len() {
-            result.push("..");
-        }
-        for comp in &target_comps[i..] {
-            match comp {
-                Component::Normal(s) => result.push(s),
-                Component::RootDir => {}
-                _ => result.push(comp.as_os_str()),
+            if i < tokens.len() {
+                if let Some(path) = resolve_include_path(tokens[i], directory) {
+                    result.push(path);
+                }
+            }
+        } else if let Some(path) = token.strip_prefix("-I") {
+            if !path.is_empty() {
+                if let Some(p) = resolve_include_path(path, directory) {
+                    result.push(p);
+                }
+            }
+        } else if let Some(path) = token.strip_prefix("-isystem") {
+            if !path.is_empty() {
+                if let Some(p) = resolve_include_path(path, directory) {
+                    result.push(p);
+                }
             }
         }
-        Some(if result.as_os_str().is_empty() {
-            PathBuf::from("")
-        } else {
-            result
-        })
+        i += 1;
+    }
+    result
+}
+
+fn resolve_include_path(path: &str, directory: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    Some(if unix_path::is_absolute(path) {
+        unix_path::normalize(path)
+    } else {
+        unix_path::join(directory, path)
+    })
+}
+
+fn build_inc_tree(commands: &[CompileCommand]) -> DirTree {
+    let mut include_dirs: HashSet<String> = HashSet::new();
+    for cmd in commands {
+        for inc in extract_include_dirs(&cmd.command, &cmd.directory) {
+            include_dirs.insert(inc);
+        }
+    }
+
+    let all_dirs: Vec<&str> = include_dirs.iter().map(|d| d.as_str()).collect();
+    let common_root = unix_path::common_prefix(&all_dirs);
+
+    let root_name = unix_path::basename(&common_root);
+
+    let mut root_node = DirNode {
+        name: root_name.clone(),
+        path: common_root.clone(),
+        files: Vec::new(),
+        dirs: BTreeMap::new(),
+    };
+
+    for dir_path in &include_dirs {
+        let rel_parts = unix_path::relative_parts(dir_path, &common_root);
+        if !rel_parts.is_empty() {
+            insert_into_tree(&mut root_node, &rel_parts, &common_root, &[]);
+        }
+    }
+
+    eprintln!(
+        "Step 3/4: Include directory tree built — {} unique -I/-isystem paths",
+        include_dirs.len()
+    );
+
+    DirTree {
+        root: common_root,
+        tree: root_node,
     }
 }
 
-// ── Step 3: dir_tree → copy_sources.sh ──────────────────────────────────────
+// ── Step 4: cpp_dir_tree + inc_dir_tree → copy_sources.sh ───────────────────
 
-fn gen_script(tree: &DirTree) -> String {
+fn gen_script(cpp_tree: &DirTree, inc_tree: &DirTree) -> String {
     let mut script = String::new();
-    let root = &tree.root;
+    let root = &cpp_tree.root;
     let root_prefix_len = root.len() + 1;
 
     script.push_str("#!/usr/bin/env bash\n");
@@ -351,18 +430,47 @@ fn gen_script(tree: &DirTree) -> String {
     script.push_str("NEW_DIR=\"$1\"\n\n");
     script.push_str(&format!("# Source root: {}\n", root));
     script.push_str("mkdir -p \"$NEW_DIR\"\n\n");
-    script.push_str("# ---- Create directory structure ----\n");
+    script.push_str("# ---- Create directory structure (C/C++ sources) ----\n");
 
-    collect_dirs(&tree.tree, root, root_prefix_len, &mut script);
+    collect_dirs(&cpp_tree.tree, root, root_prefix_len, &mut script);
+
+    let mut cpp_paths: HashSet<String> = HashSet::new();
+    collect_all_dir_paths(&cpp_tree.tree, &mut cpp_paths);
+
+    script.push_str("\n# ---- Create extra include directories ----\n");
+    collect_extra_dirs(
+        &inc_tree.tree,
+        &cpp_paths,
+        root,
+        root_prefix_len,
+        &mut script,
+    );
 
     script.push_str("\n# ---- Copy source files ----\n");
 
-    let mut file_count = 0u32;
-    collect_copies(&tree.tree, root, root_prefix_len, &mut script, &mut file_count);
+    let mut source_count = 0u32;
+    collect_copies(
+        &cpp_tree.tree,
+        root,
+        root_prefix_len,
+        &mut script,
+        &mut source_count,
+    );
+
+    script.push_str("\n# ---- Copy header files ----\n");
+
+    let mut header_dir_count = 0u32;
+    collect_header_copies(
+        &inc_tree.tree,
+        root,
+        root_prefix_len,
+        &mut script,
+        &mut header_dir_count,
+    );
 
     script.push_str(&format!(
-        "\necho \"Copied {} files into $NEW_DIR\"\n",
-        file_count
+        "\necho \"Copied {} source files + headers from {} include dirs into $NEW_DIR\"\n",
+        source_count, header_dir_count
     ));
     script.push_str("TARBALL=\"${NEW_DIR}.tgz\"\n");
     script.push_str(
@@ -375,8 +483,60 @@ fn gen_script(tree: &DirTree) -> String {
         "echo \"Done. $TARBALL created.\"\n",
     );
 
-    eprintln!("Step 3/3: Copy script generated — {} files", file_count);
+    eprintln!(
+        "Step 4/4: Copy script generated — {} source files, {} include dirs for headers",
+        source_count, header_dir_count
+    );
     script
+}
+
+fn collect_all_dir_paths(node: &DirNode, paths: &mut HashSet<String>) {
+    paths.insert(node.path.clone());
+    for child in node.dirs.values() {
+        collect_all_dir_paths(child, paths);
+    }
+}
+
+fn collect_extra_dirs(
+    node: &DirNode,
+    cpp_paths: &HashSet<String>,
+    root: &str,
+    prefix_len: usize,
+    script: &mut String,
+) {
+    if node.path != root && !cpp_paths.contains(&node.path) {
+        let rel = &node.path[prefix_len..];
+        script.push_str(&format!("mkdir -p \"$NEW_DIR/{}\"\n", rel));
+    }
+    for child in node.dirs.values() {
+        collect_extra_dirs(child, cpp_paths, root, prefix_len, script);
+    }
+}
+
+fn collect_header_copies(
+    node: &DirNode,
+    root: &str,
+    prefix_len: usize,
+    script: &mut String,
+    dir_count: &mut u32,
+) {
+    if node.path != root {
+        let rel = &node.path[prefix_len..];
+        script.push_str(&format!("if [ -d \"{}\" ]; then\n", node.path));
+        script.push_str(&format!(
+            "  for hdr in \"{}\"/*.h \"{}\"/*.hpp; do\n",
+            node.path, node.path
+        ));
+        script.push_str("    [ -f \"$hdr\" ] || continue\n");
+        script.push_str(&format!("    cp \"$hdr\" \"$NEW_DIR/{}/\"\n", rel));
+        script.push_str("  done\n");
+        script.push_str("fi\n");
+        *dir_count += 1;
+    }
+
+    for child in node.dirs.values() {
+        collect_header_copies(child, root, prefix_len, script, dir_count);
+    }
 }
 
 fn collect_dirs(node: &DirNode, root: &str, prefix_len: usize, script: &mut String) {
@@ -425,32 +585,75 @@ fn collect_copies(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+struct OutputNames {
+    prefix: String,
+    compile_commands: String,
+    cpp_dir_tree: String,
+    inc_dir_tree: String,
+    copy_sources: String,
+}
+
+/// 取参数文件名（去扩展名）按 `_` 或 `-` 分割的第一节作为输出前缀。
+fn output_names_from_input(input: &str) -> OutputNames {
+    let stem = Path::new(input)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let prefix = stem
+        .split(|c: char| c == '_' || c == '-')
+        .next()
+        .unwrap_or(stem)
+        .to_string();
+    OutputNames {
+        compile_commands: format!("{prefix}_compile_commands.json"),
+        cpp_dir_tree: format!("{prefix}_cpp_dir_tree.json"),
+        inc_dir_tree: format!("{prefix}_inc_dir_tree.json"),
+        copy_sources: format!("{prefix}_copy_sources.sh"),
+        prefix,
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <input.log>", args[0]);
-        eprintln!("  Generates: compile_commands.json, dir_tree.json, copy_sources.sh");
+        eprintln!(
+            "  Generates: <prefix>_compile_commands.json, <prefix>_cpp_dir_tree.json, ..."
+        );
+        eprintln!("  <prefix> = input filename stem before first '_' or '-'");
         std::process::exit(1);
     }
 
     let input = &args[1];
+    let out = output_names_from_input(input);
+    eprintln!("Output prefix: {}\n", out.prefix);
 
     // Step 1
     let commands = parse_log(input);
     let cc_json = serde_json::to_string_pretty(&commands).expect("Serialize failed");
-    fs::write("compile_commands.json", &cc_json).expect("write compile_commands.json");
-    eprintln!("  → compile_commands.json\n");
+    fs::write(&out.compile_commands, &cc_json)
+        .unwrap_or_else(|e| panic!("write {}: {e}", out.compile_commands));
+    eprintln!("  → {}\n", out.compile_commands);
 
     // Step 2
-    let tree = build_tree(&commands);
-    let tree_json = serde_json::to_string_pretty(&tree).expect("Serialize failed");
-    fs::write("dir_tree.json", &tree_json).expect("write dir_tree.json");
-    eprintln!("  → dir_tree.json\n");
+    let cpp_tree = build_cpp_tree(&commands);
+    let cpp_tree_json = serde_json::to_string_pretty(&cpp_tree).expect("Serialize failed");
+    fs::write(&out.cpp_dir_tree, &cpp_tree_json)
+        .unwrap_or_else(|e| panic!("write {}: {e}", out.cpp_dir_tree));
+    eprintln!("  → {}\n", out.cpp_dir_tree);
 
     // Step 3
-    let script = gen_script(&tree);
-    fs::write("copy_sources.sh", &script).expect("write copy_sources.sh");
-    eprintln!("  → copy_sources.sh\n");
+    let inc_tree = build_inc_tree(&commands);
+    let inc_tree_json = serde_json::to_string_pretty(&inc_tree).expect("Serialize failed");
+    fs::write(&out.inc_dir_tree, &inc_tree_json)
+        .unwrap_or_else(|e| panic!("write {}: {e}", out.inc_dir_tree));
+    eprintln!("  → {}\n", out.inc_dir_tree);
+
+    // Step 4
+    let script = gen_script(&cpp_tree, &inc_tree);
+    fs::write(&out.copy_sources, &script)
+        .unwrap_or_else(|e| panic!("write {}: {e}", out.copy_sources));
+    eprintln!("  → {}\n", out.copy_sources);
 
     eprintln!("All done.");
 }
